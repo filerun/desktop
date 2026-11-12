@@ -1,0 +1,168 @@
+# SPDX-FileCopyrightText: 2022 Nextcloud GmbH and Nextcloud contributors
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Manually triggered Windows build that produces an installer (.exe) and
+# uploads it as a downloadable artifact. Based on windows-build-and-test.yml.
+name: Windows Installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_tests:
+        description: 'Run unit tests after compiling (adds time)'
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Windows installer
+    runs-on: windows-2022
+    timeout-minutes: 360
+    env:
+      CRAFT_TARGET: windows-msvc2022_64-cl
+      CRAFT_MASTER_LOCATION: ${{ github.workspace }}\CraftMaster
+      CRAFT_MASTER_CONFIG: ${{ github.workspace }}\craftmaster.ini
+      PYTHON_VERSION: '3.12'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Resolve Craft dependency revisions
+        id: craft-revisions
+        shell: pwsh
+        run: |
+          function configValue($key) {
+              $escapedKey = [regex]::Escape($key)
+              $matches = @(Select-String -Path "${{ env.CRAFT_MASTER_CONFIG }}" -Pattern "^\s*$escapedKey\s*=\s*(.+?)\s*$")
+              if($matches.Count -ne 1) {
+                  throw "Expected exactly one $key value in craftmaster.ini."
+              }
+              return $matches[0].Matches[0].Groups[1].Value.Trim()
+          }
+
+          $craftRevision = configValue "CraftRevision"
+          $kdeBlueprintRef = configValue "craft/craft-blueprints-kde.revision"
+          $nextcloudBlueprintRef = configValue "craft/craft-blueprints-nextcloud.revision"
+
+          function remoteRevision($repository, $ref) {
+              $revision = git ls-remote $repository $ref
+              if($LASTEXITCODE -ne 0 -or !$revision) {
+                  throw "Could not resolve $ref from $repository."
+              }
+              return ($revision -split '\s+')[0]
+          }
+
+          $kdeBlueprintRevision = remoteRevision "https://github.com/nextcloud/craft-blueprints-kde.git" "refs/heads/$kdeBlueprintRef"
+          $nextcloudBlueprintRevision = remoteRevision "https://github.com/nextcloud/craft-blueprints-nextcloud.git" "refs/heads/$nextcloudBlueprintRef"
+          @(
+              "kde_ref=$kdeBlueprintRef"
+              "nextcloud_ref=$nextcloudBlueprintRef"
+              "key=$craftRevision-$kdeBlueprintRevision-$nextcloudBlueprintRevision"
+          ) | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Restore Craft dependencies
+        id: craft-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ env.CRAFT_MASTER_LOCATION }}
+            ${{ env.CRAFT_MASTER_CONFIG }}
+            ${{ github.workspace }}\craft-clone
+            ${{ github.workspace }}\${{ env.CRAFT_TARGET }}
+          key: ${{ runner.os }}-craft-v1-${{ env.CRAFT_TARGET }}-python-${{ env.PYTHON_VERSION }}-${{ steps.craft-revisions.outputs.key }}
+
+      - name: Install Craft Master with Nextcloud Client Deps
+        if: steps.craft-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          & cmd /C "git clone -q --depth=1 https://github.com/KDE/craftmaster.git ${{ env.CRAFT_MASTER_LOCATION }} 2>&1"
+
+          function craft() {
+              python "${{ env.CRAFT_MASTER_LOCATION }}\CraftMaster.py" --config "${{ env.CRAFT_MASTER_CONFIG }}" --target ${{ env.CRAFT_TARGET }} -c $args
+              if($LASTEXITCODE -ne 0) {exit $LASTEXITCODE}
+          }
+
+          craft --add-blueprint-repository "https://github.com/nextcloud/craft-blueprints-kde.git|${{ steps.craft-revisions.outputs.kde_ref }}|"
+          craft --add-blueprint-repository "https://github.com/nextcloud/craft-blueprints-nextcloud.git|${{ steps.craft-revisions.outputs.nextcloud_ref }}|"
+          craft craft
+          craft --install-deps nextcloud-client
+
+      - name: Save Craft dependencies
+        if: steps.craft-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ env.CRAFT_MASTER_LOCATION }}
+            ${{ env.CRAFT_MASTER_CONFIG }}
+            ${{ github.workspace }}\craft-clone
+            ${{ github.workspace }}\${{ env.CRAFT_TARGET }}
+          key: ${{ runner.os }}-craft-v1-${{ env.CRAFT_TARGET }}-python-${{ env.PYTHON_VERSION }}-${{ steps.craft-revisions.outputs.key }}
+
+      - name: Install inkscape
+        shell: pwsh
+        run: |
+          choco install inkscape -y --no-progress
+
+      - name: Setup PATH
+        shell: pwsh
+        run: |
+          echo "${{ github.workspace }}\${{ env.CRAFT_TARGET }}\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Compile
+        shell: pwsh
+        run: |
+          function craft() {
+              python "${{ env.CRAFT_MASTER_LOCATION }}\CraftMaster.py" --config "${{ env.CRAFT_MASTER_CONFIG }}" --target ${{ env.CRAFT_TARGET }} -c $args
+              if($LASTEXITCODE -ne 0) {exit $LASTEXITCODE}
+          }
+
+          craft --src-dir ${{ github.workspace }} nextcloud-client
+
+      - name: Run tests
+        if: ${{ inputs.run_tests }}
+        shell: pwsh
+        run: |
+          cd "${{ github.workspace }}\${{ env.CRAFT_TARGET }}\build\nextcloud-client\work\build"
+          & ctest --output-on-failure --timeout 300
+
+      - name: Package installer
+        shell: pwsh
+        run: |
+          function craft() {
+              python "${{ env.CRAFT_MASTER_LOCATION }}\CraftMaster.py" --config "${{ env.CRAFT_MASTER_CONFIG }}" --target ${{ env.CRAFT_TARGET }} -c $args
+              if($LASTEXITCODE -ne 0) {exit $LASTEXITCODE}
+          }
+
+          # Uses the NullsoftInstallerPackager set in craftmaster.ini (unsigned: SIGN_PACKAGE = False)
+          craft --src-dir ${{ github.workspace }} --package nextcloud-client
+
+      - name: Collect installer
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "${{ github.workspace }}\out" | Out-Null
+          $found = Get-ChildItem -Path "${{ github.workspace }}\${{ env.CRAFT_TARGET }}" -Recurse -Include *.exe, *.7z, *.msi -File -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match '\\tmp\\' -and $_.Name -match '(?i)nextcloud' }
+          if(-not $found) {
+              Write-Host "No installer found under \tmp\. Listing candidate files for debugging:"
+              Get-ChildItem -Path "${{ github.workspace }}\${{ env.CRAFT_TARGET }}" -Recurse -Include *.exe -File |
+                  Where-Object { $_.Name -match '(?i)nextcloud' } | Select-Object FullName, Length | Format-Table -AutoSize
+              exit 1
+          }
+          $found | ForEach-Object { Write-Host "Found: $($_.FullName)"; Copy-Item $_.FullName "${{ github.workspace }}\out\" }
+
+      - name: Upload installer
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nextcloud-windows-${{ github.ref_name }}-${{ github.run_number }}
+          path: ${{ github.workspace }}\out\*
+          if-no-files-found: error
+          retention-days: 14
